@@ -1,0 +1,215 @@
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+import tabula
+import tempfile
+import os
+
+def show():
+    if "df_allocated" not in st.session_state:
+        st.session_state.df_allocated=None
+    st.set_page_config(layout="wide")
+    st.title("BOM Transformation Tool")
+    
+    uploaded_file=st.file_uploader("Upload a Bill of Materials (Excel or PDF)", type=["pdf","xlsx","xls"])
+    df_raw=pd.DataFrame()
+    
+    #Converts the uploaded PDF BOM into a pandas DataFrame using Tabula
+    #Create a temporary file for Tabula, this is not run but a definition which will be run if it determines its a pdf
+    def pdf_to_dataframe(uploaded_pdf):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_pdf.read())
+            pdf_path = tmp.name
+    
+        #digests the tables in the PDF
+        try:
+            try:
+                df_list=tabula.read_pdf(pdf_path, pages="all", multiple_tables=True, lattice=True, encoding="utf-8")
+            except Exception: 
+                df_list=tabula.read_pdf(pdf_path, pages="all", multiple_tables=True, lattice=True, encoding="ISO-8859-1")
+            #removes the headder of the table
+            if len(df_list)>1:
+                df_list=df_list[1:]
+                
+            #combines all tables
+            df=pd.concat(df_list,ignore_index=True)
+            return df
+    
+        finally:
+            os.remove(pdf_path)
+        
+    #this is for the uploaded file, it looks at it and determines if it is a pdf or a   
+    if uploaded_file:
+        if uploaded_file.name.lower().endswith(".pdf"):
+            st.info("PDF detected, converting to table")
+            df_raw=pdf_to_dataframe(uploaded_file)
+        else:
+            st.info("Excel detected, reading sheet.")
+            xls=pd.ExcelFile(uploaded_file)
+            sheet_names=xls.sheet_names
+            if len(sheet_names)==1:
+                st.success(f"One Sheet Detected: {sheet_names[0]}")  
+                df_raw=pd.read_excel(uploaded_file, sheet_name=sheet_names[0])
+            else: 
+                st.info(f"{len(sheet_names)} sheets detected in this file.")
+                process_all=st.checkbox("Process all BOMs (all sheets)")
+                if process_all:
+                    df_raw={}
+                    for sheet in sheet_names:
+                        df_raw[sheet] = pd.read_excel(uploaded_file,sheet_name=sheet)
+                else:
+                    selected_sheet=st.selectbox("Select BOM sheet to analyze", sheet_names,)
+                    df_raw=pd.read_excel(uploaded_file,sheet_name=selected_sheet)            
+                
+        
+        st.subheader("Parsed BOM Preview")
+        st.dataframe(df_raw, use_container_width=True)
+    #this pulls out the numeric columns
+    numeric_columns=df_raw.select_dtypes(include=['int64','float64']).columns.tolist()
+    string_columns=df_raw.select_dtypes(include=['object']).columns.tolist()
+    
+    
+    st.subheader("Select Required Columns")
+    
+    #this is the tree level headding
+    tree_col=st.selectbox("Tree Level Column", options=numeric_columns+string_columns)
+    
+    #this is the seleciton of the other variables
+    st.subheader("Quantified Attribute")
+    value_col=st.selectbox("Select numeric value column (weight, quantity, volume, etc.)",options=numeric_columns,)
+    unit_col=st.selectbox("Select unit column (optional)", options=["None"]+string_columns,)
+    #this is the primary percentage column which is optional
+    percent_col=st.selectbox("Percentage Column (Optional)", options=["<Not Present>"] + list(df_raw.columns))    
+    #this is the percent range column which is optional
+    percent_range_col=st.selectbox("Percentage Range Column (Optional)", options=["<Not Present>"] + list(df_raw.columns))  
+    #these are for the mateiral identification columns, if there are multiple ones they can select them
+    material_cols=st.multiselect("Material Identification Columns (One or More)", options=string_columns)    
+    
+    # LCI Table (Children aggregated)
+    lci_material_col = st.selectbox("Select material identification column for Life Cycle Inventory aggregation",options=material_cols)
+    #this next set of code takes those selections and creates a new dataframe out of it
+    if st.button("Create Allocated Value Table"):
+        unit_col=None if unit_col=="None" else unit_col
+        # Copy raw data
+        df = df_raw.copy()
+    
+        # Standardize column names
+        df = df.rename(columns={tree_col: "Tree_Level"})
+        df = df.rename(columns={value_col: "Base_Value"})
+    
+        # Convert numeric values
+        df["Base_Value"] = pd.to_numeric(df["Base_Value"], errors="coerce")
+    
+        # Handle unit column safely
+        if unit_col is not None and unit_col in df.columns:
+            df["Unit"] = df[unit_col].astype(str)
+        else:
+            df["Unit"] = "unitless"
+    
+        # Handle percentages
+        # Primary percentage
+        if percent_col != "<Not Present>" and percent_col in df.columns:
+            df = df.rename(columns={percent_col: "Percent"})
+            df["Percent"] = pd.to_numeric(df["Percent"], errors="coerce")
+            df["Percent"] = df["Percent"].apply(lambda x: x/100 if x > 1 else x)
+            st.info("No percentage information detected. Assuming 100% allocation for all components.")
+        else:
+            df["Percent"] = pd.NA
+    
+        # Optional percent range
+        if percent_range_col != "<Not Present>" and percent_range_col in df.columns:
+            df = df.rename(columns={percent_range_col: "Percent_Range"})
+            range_split = df["Percent_Range"].astype(str).str.replace("%","").str.split("-", expand=True)
+            df["Percent_Lower"] = pd.to_numeric(range_split[0], errors="coerce")
+            df["Percent_Upper"] = pd.to_numeric(range_split[1], errors="coerce")
+            df["Percent_Lower"] = df["Percent_Lower"].apply(lambda x: x/100 if x > 1 else x)
+            df["Percent_Upper"] = df["Percent_Upper"].apply(lambda x: x/100 if x > 1 else x)
+        else:
+            df["Percent_Lower"] = pd.NA
+            df["Percent_Upper"] = pd.NA  
+          
+        # Forward-fill numeric values
+        df["Base_Value_Filled"] = df["Base_Value"].fillna(method="ffill")
+    
+        #Compute allocated value
+        def compute_allocated(row):
+            val = row["Base_Value_Filled"]
+            if pd.notna(row.get("Percent")):
+                return val * row["Percent"]
+            elif pd.notna(row.get("Percent_Lower")):
+                return val * row["Percent_Lower"]
+            elif pd.notna(val):
+                return val
+            else:
+                return 0
+    
+        df["Allocated_Value"] = df.apply(compute_allocated, axis=1)
+    
+        # Warning if percentages exist but no value
+        missing_value = df["Base_Value_Filled"].isna() & (df.get("Percent", pd.Series([None]*len(df))).notna()|df.get("Percent_Lower", pd.Series([None]*len(df))).notna())
+        if missing_value.any():
+            st.warning("Some rows have percentages but no value available. Allocated values may be incomplete.")
+    
+        # Prepare allocated value table for preview
+        output_cols = ["Tree_Level", "Allocated_Value"]
+        output_cols.extend(material_cols)
+        # Optional percent columns
+        for col in ["Percent", "Percent_Lower", "Percent_Upper"]:
+            if col in df.columns:
+                output_cols.append(col)
+        # Include unit
+        if "Unit" in df.columns:
+            output_cols.append("Unit")
+    
+        # Safe column selection
+        df_allocated = df[[c for c in output_cols if c in df.columns]]
+    
+        st.subheader("Allocated Value Table")
+        st.dataframe(df_allocated, use_container_width=True)
+    
+        # Parent / Child identification
+        # Clean the Tree Level column to extract just the numeric part
+        df_allocated["Tree_Level_Clean"] = df_allocated["Tree_Level"].astype(str).str.extract(r'(\d+)')
+        df_allocated["Tree_Level_Clean"] = pd.to_numeric(df_allocated["Tree_Level_Clean"], errors='coerce')
+        tree = df_allocated["Tree_Level_Clean"]     
+        
+        is_parent = []
+        for i in range(len(tree)):
+            current_level = tree.iloc[i]
+            parent_flag = False
+            if pd.notna(current_level):
+                for j in range(i+1, len(tree)):
+                    next_level = tree.iloc[j]
+                    if pd.isna(next_level):
+                        continue
+                    if next_level > current_level:
+                        parent_flag = True
+                        break
+                    if next_level <= current_level:
+                        break
+            is_parent.append(parent_flag)
+        
+        df_allocated["Is_Parent"] = is_parent
+        df_allocated["Is_Child"] = ~df_allocated["Is_Parent"]
+                   
+        df_children = df_allocated[df_allocated["Is_Child"]].copy()
+        df_lci = (df_children.groupby([lci_material_col, "Unit"], as_index=False).agg({"Allocated_Value": "sum"}))
+        df_lci = df_lci.rename(columns={lci_material_col: "Material", "Allocated_Value": "Total_Value"})
+    
+        # Costing Table (Parents only)
+        df_costing = df_allocated[df_allocated["Is_Parent"]].copy()
+        selected_cols = [c for c in material_cols if c in df_costing.columns] + ["Allocated_Value", "Unit"]
+        df_costing = df_costing[selected_cols].rename(columns={"Allocated_Value": "Total_Value"})
+    
+    
+        # Display side by side
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("LCI Table")
+            st.dataframe(df_lci, use_container_width=True)
+        with col2:
+            st.subheader("Costing Table")
+            st.dataframe(df_costing, use_container_width=True)
+        st.session_state.df_allocated=df_allocated
+    

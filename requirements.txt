@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+tabula-py
+openpyxl
+xlrd
